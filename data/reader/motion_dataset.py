@@ -404,8 +404,8 @@ class MotionDataset3D(Dataset):
         file_path = self.file_list[idx]
         motion_file = read_pkl(file_path)
 
-        motion_2d = motion_file["data_input"]
-        motion_3d = motion_file["data_label"]
+        motion_2d = motion_file.get("data_input", None)
+        motion_3d = motion_file.get("data_label", None)
 
         if motion_2d is None or self.use_proj_as_2d:
             motion_2d = self._construct_motion2d_by_projection(motion_3d)

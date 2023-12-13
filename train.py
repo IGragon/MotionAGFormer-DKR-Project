@@ -6,30 +6,29 @@ import pkg_resources
 import torch
 import wandb
 from torch import optim
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from loss.pose3d import loss_mpjpe, n_mpjpe, loss_velocity, loss_limb_var, loss_limb_gt, loss_angle, \
-    loss_angle_velocity
-from loss.pose3d import jpe as calculate_jpe
-from loss.pose3d import p_mpjpe as calculate_p_mpjpe
-from loss.pose3d import mpjpe as calculate_mpjpe
-from loss.pose3d import acc_error as calculate_acc_err
 from data.const import H36M_JOINT_TO_LABEL, H36M_UPPER_BODY_JOINTS, H36M_LOWER_BODY_JOINTS, H36M_1_DF, H36M_2_DF, \
     H36M_3_DF
 from data.reader.h36m import DataReaderH36M
 from data.reader.motion_dataset import MotionDataset3D
+from loss.pose3d import acc_error as calculate_acc_err
+from loss.pose3d import jpe as calculate_jpe
+from loss.pose3d import loss_mpjpe, n_mpjpe, loss_velocity, loss_limb_var, loss_limb_gt, loss_angle, \
+    loss_angle_velocity
+from loss.pose3d import mpjpe as calculate_mpjpe
+from loss.pose3d import p_mpjpe as calculate_p_mpjpe
 from utils.data import flip_data
-from utils.tools import set_random_seed, get_config, print_args, create_directory_if_not_exists
-from torch.utils.data import DataLoader
-
 from utils.learning import load_model, AverageMeter, decay_lr_exponentially
 from utils.tools import count_param_numbers
-from utils.data import Augmenter2D
+from utils.tools import set_random_seed, get_config, print_args, create_directory_if_not_exists
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="configs/h36m/MotionAGFormer-base.yaml", help="Path to the config file.")
+    parser.add_argument("--config", type=str, default="configs/h36m/MotionAGFormer-base.yaml",
+                        help="Path to the config file.")
     parser.add_argument('-c', '--checkpoint', type=str, metavar='PATH',
                         help='checkpoint directory')
     parser.add_argument('--new-checkpoint', type=str, metavar='PATH', default='checkpoint',
@@ -71,12 +70,12 @@ def train_one_epoch(args, model, train_loader, optimizer, device, losses):
         loss_av = loss_angle_velocity(pred, y)
 
         loss_total = loss_3d_pos + \
-                    args.lambda_scale * loss_3d_scale + \
-                    args.lambda_3d_velocity * loss_3d_velocity + \
-                    args.lambda_lv * loss_lv + \
-                    args.lambda_lg * loss_lg + \
-                    args.lambda_a * loss_a + \
-                    args.lambda_av * loss_av
+                     args.lambda_scale * loss_3d_scale + \
+                     args.lambda_3d_velocity * loss_3d_velocity + \
+                     args.lambda_lv * loss_lv + \
+                     args.lambda_lg * loss_lg + \
+                     args.lambda_a * loss_a + \
+                     args.lambda_av * loss_av
 
         losses['3d_pose'].update(loss_3d_pos.item(), batch_size)
         losses['3d_scale'].update(loss_3d_scale.item(), batch_size)
@@ -89,6 +88,7 @@ def train_one_epoch(args, model, train_loader, optimizer, device, losses):
 
         loss_total.backward()
         optimizer.step()
+
 
 def evaluate(args, model, test_loader, datareader, device):
     print("[INFO] Evaluation")
@@ -211,7 +211,8 @@ def evaluate(args, model, test_loader, datareader, device):
         )
     joint_errors = np.array(joint_errors)
     e1 = np.mean(np.array(final_result))
-    assert round(e1, 4) == round(np.mean(joint_errors), 4), f"MPJPE {e1:.4f} is not equal to mean of joint errors {np.mean(joint_errors):.4f}"
+    assert round(e1, 4) == round(np.mean(joint_errors),
+                                 4), f"MPJPE {e1:.4f} is not equal to mean of joint errors {np.mean(joint_errors):.4f}"
     acceleration_error = np.mean(np.array(final_result_acceleration))
     e2 = np.mean(np.array(final_result_procrustes))
     print('Protocol #1 Error (MPJPE):', e1, 'mm')
@@ -219,6 +220,26 @@ def evaluate(args, model, test_loader, datareader, device):
     print('Protocol #2 Error (P-MPJPE):', e2, 'mm')
     print('----------')
     return e1, e2, joint_errors, acceleration_error
+
+
+def evaluate_accad(args, model, test_loader, device):
+    predicted = []
+    target = []
+    model.eval()
+    for x, y in test_loader:
+        with torch.inference_mode():
+            predicted.append(model(x.to(device)).detach().cpu().numpy())
+        target.append(y.numpy())
+    predicted = np.concatenate(predicted)
+    target = np.concatenate(target)
+    predicted = predicted - predicted[:, :, 0:1, :]
+    target = target - target[:, :, 0:1, :]
+
+    err1 = np.array([calculate_mpjpe(pred, gt) for pred, gt in zip(predicted, target)])
+    err2 = np.array([calculate_p_mpjpe(pred, gt) for pred, gt in zip(predicted, target)])
+    joints_errors = calculate_jpe(predicted, target)
+    acceleration_error = np.array([calculate_acc_err(pred, gt) for pred, gt in zip(predicted, target)])
+    return err1.mean(), err2.mean(), joints_errors.mean(axis=(0, 1)), acceleration_error.mean()
 
 
 def save_checkpoint(checkpoint_path, epoch, lr, optimizer, model, min_mpjpe, wandb_id):
@@ -249,10 +270,12 @@ def train(args, opts):
     train_loader = DataLoader(train_dataset, shuffle=True, **common_loader_params)
     test_loader = DataLoader(test_dataset, shuffle=False, **common_loader_params)
 
-    datareader = DataReaderH36M(n_frames=args.n_frames, sample_stride=1,
-                                data_stride_train=args.n_frames // 3, data_stride_test=args.n_frames,
-                                dt_root='data/motion3d', dt_file=args.dt_file)  # Used for H36m evaluation
-
+    if args.dt_file:
+        datareader = DataReaderH36M(n_frames=args.n_frames, sample_stride=1,
+                                    data_stride_train=args.n_frames // 3, data_stride_test=args.n_frames,
+                                    dt_root='data/motion3d', dt_file=args.dt_file)  # Used for H36m evaluation
+    else:
+        datareader = None
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model = load_model(args)
     if torch.cuda.is_available():
@@ -272,7 +295,8 @@ def train(args, opts):
     wandb_id = opts.wandb_run_id if opts.wandb_run_id is not None else wandb.util.generate_id()
 
     if opts.checkpoint:
-        checkpoint_path = os.path.join(opts.checkpoint, opts.checkpoint_file if opts.checkpoint_file else "latest_epoch.pth.tr")
+        checkpoint_path = os.path.join(opts.checkpoint,
+                                       opts.checkpoint_file if opts.checkpoint_file else "latest_epoch.pth.tr")
         if os.path.exists(checkpoint_path):
             checkpoint = torch.load(checkpoint_path, map_location=lambda storage, loc: storage)
             model.load_state_dict(checkpoint['model'], strict=True)
@@ -292,16 +316,15 @@ def train(args, opts):
         if opts.resume:
             if opts.use_wandb:
                 wandb.init(id=wandb_id,
-                        project='MotionMetaFormer',
-                        resume="must",
-                        settings=wandb.Settings(start_method='fork'))
+                           project='MotionMetaFormer',
+                           resume="must",
+                           settings=wandb.Settings(start_method='fork'))
         else:
             print(f"Run ID: {wandb_id}")
             if opts.use_wandb:
                 wandb.init(id=wandb_id,
-                        name=opts.wandb_name,
-                        project='MotionMetaFormer',
-                        settings=wandb.Settings(start_method='fork'))
+                           name=opts.wandb_name,
+                           project='MotionMetaFormer')
                 wandb.config.update({"run_id": wandb_id})
                 wandb.config.update(args)
                 installed_packages = {d.project_name: d.version for d in pkg_resources.working_set}
@@ -312,7 +335,10 @@ def train(args, opts):
 
     for epoch in range(epoch_start, args.epochs):
         if opts.eval_only:
-            evaluate(args, model, test_loader, datareader, device)
+            if datareader:
+                evaluate(args, model, test_loader, datareader, device)
+            else:
+                evaluate_accad(args, model, test_loader, device)
             exit()
 
         print(f"[INFO] epoch {epoch}")
@@ -321,7 +347,10 @@ def train(args, opts):
 
         train_one_epoch(args, model, train_loader, optimizer, device, losses)
 
-        mpjpe, p_mpjpe, joints_error, acceleration_error = evaluate(args, model, test_loader, datareader, device)
+        if datareader:
+            mpjpe, p_mpjpe, joints_error, acceleration_error = evaluate(args, model, test_loader, datareader, device)
+        else:
+            mpjpe, p_mpjpe, joints_error, acceleration_error = evaluate_accad(args, model, test_loader, device)
 
         if mpjpe < min_mpjpe:
             min_mpjpe = mpjpe
@@ -369,7 +398,7 @@ def main():
     set_random_seed(opts.seed)
     torch.backends.cudnn.benchmark = False
     args = get_config(opts.config)
-    
+
     train(args, opts)
 
 
